@@ -172,6 +172,8 @@ impl Plugin for AtmospherePlugin {
                 Render,
                 (
                     configure_camera_depth_usages.in_set(RenderSystems::PrepareViews),
+                    split_main_pass_for_atmosphere
+                        .in_set(bevy_render::view::MainPassLayoutSystems::Restrict),
                     queue_render_sky_pipelines.in_set(RenderSystems::Queue),
                     prepare_atmosphere_textures.in_set(RenderSystems::PrepareResources),
                     prepare_probe_textures
@@ -198,6 +200,16 @@ impl Plugin for AtmospherePlugin {
                         .before(main_transparent_pass_3d),
                 ),
             );
+    }
+}
+
+/// Keeps the main pass split for views that render the atmosphere sky: `render_sky` runs
+/// between the opaque and transparent passes and loads the multisampled color.
+fn split_main_pass_for_atmosphere(
+    mut views: Query<&mut bevy_render::view::MainPassLayout, With<ExtractedAtmosphere>>,
+) {
+    for mut layout in &mut views {
+        layout.require_split();
     }
 }
 

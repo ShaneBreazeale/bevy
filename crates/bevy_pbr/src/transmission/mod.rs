@@ -12,6 +12,7 @@ use bevy_reflect::prelude::*;
 use bevy_render::{
     extract_component::{ExtractComponent, ExtractComponentPlugin},
     render_phase::{sort_phase_system, AddRenderCommand, DrawFunctions, ViewSortedRenderPhases},
+    view::{ExtractedView, MainPassLayout, MainPassLayoutSystems},
     ExtractSchedule, Render, RenderApp, RenderSystems,
 };
 pub use node::main_transmissive_pass_3d;
@@ -44,7 +45,10 @@ impl Plugin for ScreenSpaceTransmissionPlugin {
             .add_systems(ExtractSchedule, phase::extract_transmissive_camera_phases)
             .add_systems(
                 Render,
-                prepare_core_3d_transmission_textures.in_set(RenderSystems::PrepareResources),
+                (
+                    prepare_core_3d_transmission_textures.in_set(RenderSystems::PrepareResources),
+                    split_main_pass_for_transmission.in_set(MainPassLayoutSystems::Restrict),
+                ),
             )
             .add_systems(
                 Core3d,
@@ -53,6 +57,25 @@ impl Plugin for ScreenSpaceTransmissionPlugin {
                     .before(main_transparent_pass_3d)
                     .in_set(Core3dSystems::MainPass),
             );
+    }
+}
+
+/// Keeps the main pass split for views that draw transmissive items this frame.
+///
+/// The transmissive pass runs between the opaque and transparent passes, samples the resolved
+/// opaque result and loads the multisampled attachments.
+pub fn split_main_pass_for_transmission(
+    mut views: Query<(&ExtractedView, &mut MainPassLayout)>,
+    transmissive_phases: Res<ViewSortedRenderPhases<Transmissive3d>>,
+) {
+    for (view, mut layout) in &mut views {
+        if layout.is_merged()
+            && transmissive_phases
+                .get(&view.retained_view_entity)
+                .is_some_and(|phase| !phase.items.is_empty())
+        {
+            layout.require_split();
+        }
     }
 }
 

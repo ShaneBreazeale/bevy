@@ -1,5 +1,5 @@
 use crate::{
-    core_3d::Opaque3d,
+    core_3d::{Opaque3d, Transparent3d},
     skybox::{SkyboxBindGroup, SkyboxPipelineId},
 };
 use bevy_camera::{MainPassResolutionOverride, Viewport};
@@ -10,10 +10,10 @@ use bevy_log::info_span;
 use bevy_render::{
     camera::ExtractedCamera,
     diagnostic::RecordDiagnostics,
-    render_phase::ViewBinnedRenderPhases,
-    render_resource::{PipelineCache, RenderPassDescriptor, StoreOp},
+    render_phase::{ViewBinnedRenderPhases, ViewSortedRenderPhases},
+    render_resource::{PipelineCache, RenderPassDescriptor, StoreOp, TextureUsages},
     renderer::{RenderContext, ViewQuery},
-    view::{ExtractedView, ViewDepthStencilTexture, ViewTarget, ViewUniformOffset},
+    view::{ExtractedView, MainPassLayout, ViewDepthStencilTexture, ViewTarget, ViewUniformOffset},
 };
 
 use super::AlphaMask3d;
@@ -29,9 +29,11 @@ pub fn main_opaque_pass_3d(
         Option<&SkyboxBindGroup>,
         &ViewUniformOffset,
         Option<&MainPassResolutionOverride>,
+        Option<&MainPassLayout>,
     )>,
     opaque_phases: Res<ViewBinnedRenderPhases<Opaque3d>>,
     alpha_mask_phases: Res<ViewBinnedRenderPhases<AlphaMask3d>>,
+    transparent_phases: Res<ViewSortedRenderPhases<Transparent3d>>,
     pipeline_cache: Res<PipelineCache>,
     mut ctx: RenderContext,
 ) {
@@ -46,7 +48,9 @@ pub fn main_opaque_pass_3d(
         skybox_bind_group,
         view_uniform_offset,
         resolution_override,
+        layout,
     ) = view.into_inner();
+    let layout = layout.copied().unwrap_or_default();
 
     let (Some(opaque_phase), Some(alpha_mask_phase)) = (
         opaque_phases.get(&extracted_view.retained_view_entity),
@@ -61,8 +65,31 @@ pub fn main_opaque_pass_3d(
     let diagnostics = ctx.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
 
-    let color_attachments = [Some(target.get_color_attachment())];
-    let depth_stencil_attachment = Some(depth.get_attachment(StoreOp::Store));
+    let (color_attachments, depth_stencil_attachment) = match layout {
+        MainPassLayout::Split => (
+            [Some(target.get_color_attachment())],
+            Some(depth.get_attachment(StoreOp::Store)),
+        ),
+        // This is the only main pass: nothing loads the multisampled color after the resolve,
+        // and depth is only needed if another view or a later pass reads it.
+        MainPassLayout::Merged { keep_depth } => {
+            let depth_is_read = depth
+                .texture()
+                .usage()
+                .intersects(TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_SRC);
+            let depth_store = if keep_depth || depth_is_read {
+                StoreOp::Store
+            } else {
+                StoreOp::Discard
+            };
+            (
+                [Some(
+                    target.get_color_attachment_with_store(StoreOp::Discard),
+                )],
+                Some(depth.get_attachment(depth_store)),
+            )
+        }
+    };
 
     let mut render_pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
         label: Some("main_opaque_pass_3d"),
@@ -107,6 +134,20 @@ pub fn main_opaque_pass_3d(
             &[view_uniform_offset.offset, skybox_bind_group.1],
         );
         render_pass.draw(0..3, 0..1);
+    }
+
+    // With the merged layout the transparent phase is drawn here, after the skybox, instead of
+    // in `main_transparent_pass_3d`.
+    if layout.is_merged()
+        && let Some(transparent_phase) =
+            transparent_phases.get(&extracted_view.retained_view_entity)
+        && !transparent_phase.items.is_empty()
+    {
+        #[cfg(feature = "trace")]
+        let _transparent_main_pass_3d_span = info_span!("transparent_main_pass_3d").entered();
+        if let Err(err) = transparent_phase.render(&mut render_pass, world, view_entity) {
+            error!("Error encountered while rendering the transparent phase {err:?}");
+        }
     }
 
     pass_span.end(&mut render_pass);

@@ -32,7 +32,7 @@ pub const DEPTH_PREPASS_TEXTURE_SUPPORTED: bool = true;
 
 use core::ops::Range;
 
-use bevy_camera::{Camera, Camera3d, Camera3dDepthLoadOp};
+use bevy_camera::{Camera, Camera3d, Camera3dDepthLoadOp, ClearColorConfig, MsaaWriteback};
 use bevy_diagnostic::FrameCount;
 use bevy_render::{
     batching::gpu_preprocessing::{GpuPreprocessingMode, GpuPreprocessingSupport},
@@ -41,7 +41,10 @@ use bevy_render::{
     occlusion_culling::OcclusionCulling,
     render_phase::{PhaseItemBatchSetKey, ViewRangefinder3d},
     texture::{CachedTexture, DepthStencilAttachment},
-    view::{prepare_view_targets, NoIndirectDrawing, RetainedViewEntity},
+    view::{
+        prepare_view_targets, MainPassLayout, MainPassLayoutSystems, MainPassSplitRequired,
+        MergedMainPass, NoIndirectDrawing, RetainedViewEntity, TransientMsaa, ViewTarget,
+    },
 };
 use indexmap::IndexMap;
 pub use main_opaque_pass_3d_node::*;
@@ -77,6 +80,7 @@ use nonmax::NonMaxU32;
 
 use crate::deferred::copy_lighting_id::copy_deferred_lighting_id;
 use crate::deferred::node::{early_deferred_prepass, late_deferred_prepass};
+use crate::oit::OrderIndependentTransparencySettings;
 use crate::prepass::node::{early_prepass, late_prepass};
 use crate::tonemapping::tonemapping;
 use crate::upscaling::upscaling;
@@ -137,6 +141,7 @@ impl Plugin for Core3dPlugin {
                         .after(prepare_view_targets)
                         .in_set(RenderSystems::PrepareViews)
                         .ambiguous_with(RenderSystems::PrepareViews),
+                    prepare_main_pass_layouts.in_set(MainPassLayoutSystems::Decide),
                     prepare_core_3d_depth_textures.in_set(RenderSystems::PrepareResources),
                     prepare_prepass_textures.in_set(RenderSystems::PrepareResources),
                 ),
@@ -674,10 +679,16 @@ pub fn prepare_core_3d_depth_textures(
         Option<&DepthPrepass>,
         &Camera3d,
         &Msaa,
+        Option<&MainPassLayout>,
+        Has<TransientMsaa>,
     )>,
 ) {
     let mut render_target_usage = <HashMap<_, _>>::default();
-    for (_, camera, depth_prepass, camera_3d, _msaa) in &views_3d {
+    let mut views_per_texture = <HashMap<_, usize>>::default();
+    for (_, camera, depth_prepass, camera_3d, msaa, _, _) in &views_3d {
+        *views_per_texture
+            .entry((camera.target.clone(), *msaa))
+            .or_default() += 1;
         // Default usage required to write to the depth texture
         let mut usage: TextureUsages = camera_3d.depth_texture_usages.into();
         if depth_prepass.is_some() {
@@ -691,7 +702,7 @@ pub fn prepare_core_3d_depth_textures(
     }
 
     let mut textures = <HashMap<_, _>>::default();
-    for (entity, camera, _, camera_3d, msaa) in &views_3d {
+    for (entity, camera, _, camera_3d, msaa, layout, transient_msaa) in &views_3d {
         let Some(physical_target_size) = camera.physical_target_size else {
             continue;
         };
@@ -699,9 +710,21 @@ pub fn prepare_core_3d_depth_textures(
         let cached_texture = textures
             .entry((camera.target.clone(), msaa))
             .or_insert_with(|| {
-                let usage = *render_target_usage
+                let mut usage = *render_target_usage
                     .get(&camera.target.clone())
                     .expect("The depth texture usage should already exist for this target");
+
+                // A multisampled depth texture that only this view's merged main pass uses,
+                // and that is cleared there and never read, can stay in tile memory.
+                if transient_msaa
+                    && msaa.samples() > 1
+                    && usage == TextureUsages::RENDER_ATTACHMENT
+                    && views_per_texture[&(camera.target.clone(), *msaa)] == 1
+                    && layout.is_some_and(MainPassLayout::is_merged)
+                    && matches!(camera_3d.depth_load_op, Camera3dDepthLoadOp::Clear(_))
+                {
+                    usage |= TextureUsages::TRANSIENT_ATTACHMENT;
+                }
 
                 let descriptor = TextureDescriptor {
                     label: Some("view_depth_texture"),
@@ -727,6 +750,91 @@ pub fn prepare_core_3d_depth_textures(
             },
             None,
         ));
+    }
+}
+
+/// Decides the [`MainPassLayout`] of every 3D view for this frame.
+///
+/// A view gets [`MainPassLayout::Merged`] if its camera has [`MergedMainPass`], MSAA is
+/// enabled, order-independent transparency is off, the camera has no
+/// [`MainPassSplitRequired`], and no later camera loads the multisampled color of the same
+/// main texture without MSAA writeback. Systems in [`MainPassLayoutSystems::Restrict`] can still
+/// downgrade it to [`MainPassLayout::Split`] afterwards.
+pub fn prepare_main_pass_layouts(
+    mut commands: Commands,
+    mut views_3d: Query<
+        (
+            Entity,
+            &ExtractedCamera,
+            &ViewTarget,
+            &Msaa,
+            Has<MergedMainPass>,
+            Has<MainPassSplitRequired>,
+            Has<OrderIndependentTransparencySettings>,
+            Option<&mut MainPassLayout>,
+        ),
+        With<Camera3d>,
+    >,
+    all_views: Query<(&ExtractedCamera, &ViewTarget)>,
+) {
+    // The highest camera index that loads the multisampled color of each main texture as it is,
+    // without MSAA writeback refilling it from the resolved texture first.
+    let mut loads_samples = <HashMap<_, usize>>::default();
+    // The number of 3D views sharing each depth texture.
+    let mut depth_users = <HashMap<_, usize>>::default();
+    for (camera, view_target) in &all_views {
+        if matches!(camera.clear_color, ClearColorConfig::None)
+            && camera.msaa_writeback == MsaaWriteback::Off
+        {
+            loads_samples
+                .entry(view_target.main_texture().id())
+                .and_modify(|index: &mut usize| {
+                    *index = (*index).max(camera.sorted_camera_index_for_target);
+                })
+                .or_insert(camera.sorted_camera_index_for_target);
+        }
+    }
+    for (_, camera, _, msaa, ..) in &views_3d {
+        *depth_users
+            .entry((camera.target.clone(), *msaa))
+            .or_default() += 1;
+    }
+
+    for (entity, camera, view_target, msaa, merged, split_required, has_oit, layout) in
+        &mut views_3d
+    {
+        let later_view_loads_samples = loads_samples
+            .get(&view_target.main_texture().id())
+            .is_some_and(|index| *index > camera.sorted_camera_index_for_target);
+
+        // WebGL2 adds an empty render pass after the transparent pass that loads and resolves
+        // the multisampled color when the camera has a viewport.
+        let webgl_viewport_reset = cfg!(all(
+            feature = "webgl",
+            target_arch = "wasm32",
+            not(feature = "webgpu")
+        )) && camera.viewport.is_some();
+
+        let new_layout = if merged
+            && msaa.samples() > 1
+            && !split_required
+            && !has_oit
+            && !later_view_loads_samples
+            && !webgl_viewport_reset
+        {
+            MainPassLayout::Merged {
+                keep_depth: depth_users[&(camera.target.clone(), *msaa)] > 1,
+            }
+        } else {
+            MainPassLayout::Split
+        };
+
+        match layout {
+            Some(mut layout) => *layout = new_layout,
+            None => {
+                commands.entity(entity).insert(new_layout);
+            }
+        }
     }
 }
 

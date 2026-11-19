@@ -163,6 +163,11 @@ impl Plugin for WireframePlugin {
                     .before(Core3dSystems::EarlyPostProcess),
             )
             .add_systems(
+                Render,
+                split_main_pass_for_wireframes
+                    .in_set(bevy_render::view::MainPassLayoutSystems::Restrict),
+            )
+            .add_systems(
                 ExtractSchedule,
                 (
                     extract_wireframe_3d_camera,
@@ -801,6 +806,23 @@ impl SpecializedMeshPipeline for Wireframe3dPipeline {
         }
 
         Ok(descriptor)
+    }
+}
+
+/// Keeps the main pass split for views that draw wireframes this frame: the wireframe pass
+/// runs after the main pass and loads its multisampled attachments.
+fn split_main_pass_for_wireframes(
+    mut views: Query<(&ExtractedView, &mut bevy_render::view::MainPassLayout)>,
+    wireframe_phases: Res<ViewBinnedRenderPhases<Wireframe3d>>,
+) {
+    for (view, mut layout) in &mut views {
+        if layout.is_merged()
+            && wireframe_phases
+                .get(&view.retained_view_entity)
+                .is_some_and(|phase| !phase.is_empty())
+        {
+            layout.require_split();
+        }
     }
 }
 

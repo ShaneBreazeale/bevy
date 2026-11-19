@@ -1,4 +1,5 @@
 pub mod composition;
+pub mod main_pass;
 pub mod visibility;
 pub mod window;
 
@@ -8,6 +9,7 @@ use bevy_camera::{
 };
 use bevy_diagnostic::FrameCount;
 pub use composition::*;
+pub use main_pass::*;
 pub use visibility::*;
 pub use window::*;
 
@@ -176,6 +178,9 @@ impl Plugin for ViewPlugin {
             .add_plugins((
                 ExtractComponentPlugin::<Msaa>::default(),
                 ExtractComponentPlugin::<OcclusionCulling>::default(),
+                ExtractComponentPlugin::<MergedMainPass>::default(),
+                ExtractComponentPlugin::<TransientMsaa>::default(),
+                ExtractComponentPlugin::<MainPassSplitRequired>::default(),
                 RenderVisibilityRangePlugin,
             ));
 
@@ -185,6 +190,17 @@ impl Plugin for ViewPlugin {
                 ResolveCompositingSpaces
                     .in_set(RenderSystems::CreateViews)
                     .after(crate::camera::sort_cameras),
+            );
+            render_app.configure_sets(
+                Render,
+                (
+                    MainPassLayoutSystems::Decide,
+                    MainPassLayoutSystems::Restrict,
+                    MainPassLayoutSystems::Finalize,
+                )
+                    .chain()
+                    .in_set(RenderSystems::Prepare)
+                    .before(RenderSystems::PrepareResources),
             );
             render_app.add_systems(
                 Render,
@@ -208,6 +224,7 @@ impl Plugin for ViewPlugin {
                         .ambiguous_with(crate::camera::sort_cameras), // doesn't use `sorted_camera_index_for_target`
                     prepare_view_uniforms.in_set(RenderSystems::PrepareResources),
                     collect_visible_cpu_culled_entities.in_set(RenderSystems::PrepareAssets),
+                    finalize_transient_msaa_textures.in_set(MainPassLayoutSystems::Finalize),
                 ),
             );
         }
@@ -912,6 +929,21 @@ impl ViewTarget {
         }
     }
 
+    /// Retrieve this target's main texture's color attachment, with `store` as the store
+    /// operation of the multisampled texture when MSAA is enabled.
+    ///
+    /// The multisampled texture is still resolved into the main texture at the end of the
+    /// pass. With [`StoreOp::Discard`] its samples are not written back to memory, which saves
+    /// bandwidth when no later pass loads them (see [`MergedMainPass`]). Without MSAA this is
+    /// the same as [`Self::get_color_attachment`].
+    pub fn get_color_attachment_with_store(&self, store: StoreOp) -> RenderPassColorAttachment<'_> {
+        let mut attachment = self.get_color_attachment();
+        if attachment.resolve_target.is_some() {
+            attachment.ops.store = store;
+        }
+        attachment
+    }
+
     /// Retrieve this target's "unsampled" main texture's color attachment.
     pub fn get_unsampled_color_attachment(&self) -> RenderPassColorAttachment<'_> {
         if self.main_texture.load(Ordering::SeqCst) == 0 {
@@ -983,6 +1015,12 @@ impl ViewTarget {
             .resolve_target
             .as_ref()
             .map(|sampled| &sampled.default_view)
+    }
+
+    /// Replaces the multisampled texture of both main textures.
+    pub(crate) fn replace_sampled_main_texture(&mut self, sampled: CachedTexture) {
+        self.main_textures.a.resolve_target = Some(sampled.clone());
+        self.main_textures.b.resolve_target = Some(sampled);
     }
 
     /// Currently bevy's main texture format can be:
@@ -1377,6 +1415,15 @@ type MainTextureKey = (
     Msaa,
 );
 
+/// The extra view formats of a main texture with the given format.
+pub(crate) fn main_texture_view_formats(format: TextureFormat) -> &'static [TextureFormat] {
+    match format {
+        TextureFormat::Bgra8Unorm => &[TextureFormat::Bgra8UnormSrgb],
+        TextureFormat::Rgba8Unorm => &[TextureFormat::Rgba8UnormSrgb],
+        _ => &[],
+    }
+}
+
 fn main_texture_key(
     camera: &ExtractedCamera,
     view: &ExtractedView,
@@ -1403,14 +1450,26 @@ pub fn prepare_view_targets(
         &CameraMainTextureUsages,
         &Msaa,
         Option<&ResolvedCompositingSpace>,
+        Has<TransientMsaa>,
     )>,
     view_target_attachments: Res<ViewTargetAttachments>,
     mut main_texture_atomics: Local<HashMap<MainTextureKey, Weak<AtomicUsize>>>,
 ) {
     main_texture_atomics.retain(|_, weak| weak.strong_count() > 0);
 
+    // A transient multisampled texture can't be shared, since each view's main pass would
+    // clear it and discard it at the end.
+    let mut views_per_key = <HashMap<MainTextureKey, usize>>::default();
+    for (_, camera, view, texture_usage, msaa, _, _) in cameras.iter() {
+        *views_per_key
+            .entry(main_texture_key(camera, view, texture_usage, *msaa))
+            .or_default() += 1;
+    }
+
     let mut textures = <HashMap<_, _>>::default();
-    for (entity, camera, view, texture_usage, msaa, resolved_space) in cameras.iter() {
+    for (entity, camera, view, texture_usage, msaa, resolved_space, transient_msaa) in
+        cameras.iter()
+    {
         let Some(target_size) = camera.physical_target_size else {
             // If we don't have a target size, we can't create the main texture and have to bail
             commands.entity(entity).try_remove::<ViewTarget>();
@@ -1457,11 +1516,7 @@ pub fn prepare_view_targets(
                 dimension: TextureDimension::D2,
                 format: main_texture_format,
                 usage: texture_usage.0,
-                view_formats: match main_texture_format {
-                    TextureFormat::Bgra8Unorm => &[TextureFormat::Bgra8UnormSrgb],
-                    TextureFormat::Rgba8Unorm => &[TextureFormat::Rgba8UnormSrgb],
-                    _ => &[],
-                },
+                view_formats: main_texture_view_formats(main_texture_format),
             };
             let a = texture_cache.get(
                 &render_device,
@@ -1478,6 +1533,16 @@ pub fn prepare_view_targets(
                 },
             );
             let sampled = if msaa.samples() > 1 {
+                // Starts out transient when the camera asks for it. If the main pass of this
+                // view ends up split this frame, `finalize_transient_msaa_textures` swaps in a
+                // regular texture before anything renders.
+                let usage = if transient_msaa
+                    && transient_msaa_color_allowed(camera, *msaa, views_per_key[&key])
+                {
+                    TextureUsages::RENDER_ATTACHMENT | TextureUsages::TRANSIENT_ATTACHMENT
+                } else {
+                    TextureUsages::RENDER_ATTACHMENT
+                };
                 let sampled = texture_cache.get(
                     &render_device,
                     TextureDescriptor {
@@ -1487,7 +1552,7 @@ pub fn prepare_view_targets(
                         sample_count: msaa.samples(),
                         dimension: TextureDimension::D2,
                         format: main_texture_format,
-                        usage: TextureUsages::RENDER_ATTACHMENT,
+                        usage,
                         view_formats: descriptor.view_formats,
                     },
                 );

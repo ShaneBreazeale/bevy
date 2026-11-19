@@ -13,7 +13,7 @@ use bevy_render::{
     render_phase::ViewSortedRenderPhases,
     render_resource::{PipelineCache, RenderPassDescriptor, StoreOp},
     renderer::{RenderContext, ViewQuery},
-    view::{ExtractedView, ViewDepthStencilTexture, ViewTarget},
+    view::{ExtractedView, MainPassLayout, ViewDepthStencilTexture, ViewTarget},
 };
 
 pub fn main_transparent_pass_3d(
@@ -26,6 +26,7 @@ pub fn main_transparent_pass_3d(
         Option<&MainPassResolutionOverride>,
         Has<OrderIndependentTransparencySettings>,
         Option<&OitResolvePipelineId>,
+        Option<&MainPassLayout>,
     )>,
     transparent_phases: Res<ViewSortedRenderPhases<Transparent3d>>,
     mut ctx: RenderContext,
@@ -40,7 +41,13 @@ pub fn main_transparent_pass_3d(
         resolution_override,
         has_oit,
         oit_resolve_pipeline_id,
+        layout,
     ) = view.into_inner();
+
+    // `main_opaque_pass_3d` already drew the transparent phase.
+    if layout.is_some_and(MainPassLayout::is_merged) {
+        return;
+    }
 
     let Some(transparent_phase) = transparent_phases.get(&extracted_view.retained_view_entity)
     else {

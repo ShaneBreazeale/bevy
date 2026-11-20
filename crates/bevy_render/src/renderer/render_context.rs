@@ -113,11 +113,18 @@ fn finish_sequential(
 
 /// Finishes pending command encoders in parallel on the [`ComputeTaskPool`],
 /// then reassembles the command buffers in their original order.
+///
+/// Before finishing, each run of consecutive encoders is merged into at most
+/// [`encoder_chunks`] encoders (`wgpu::CommandEncoder::append`), so the frame
+/// submits a handful of large command buffers instead of one per render system
+/// and view. Order is unchanged: an encoder only absorbs the encoders that
+/// directly follow it. Finishing still runs in parallel, one task per chunk.
 #[cfg(not(target_arch = "wasm32"))]
 fn finish_parallel(
     commands: impl Iterator<Item = PendingCommandBuffer>,
 ) -> impl Iterator<Item = CommandBuffer> {
-    let mut command_buffers = Vec::with_capacity(commands.size_hint().0);
+    let commands = merge_encoders(commands.collect());
+    let mut command_buffers = Vec::with_capacity(commands.len());
     let mut finished_encoders = ComputeTaskPool::get().scope(|scope| {
         for (index, command) in commands.into_iter().enumerate() {
             match command {
@@ -145,6 +152,87 @@ fn finish_parallel(
     command_buffers
         .into_iter()
         .map(|(_, command_buffer)| command_buffer)
+}
+
+/// How many encoders a run of pending encoders is merged into. PROTOTYPE knob:
+/// `BEVY_ENCODER_CHUNKS` (0 = no merging); default = compute pool threads.
+#[cfg(not(target_arch = "wasm32"))]
+fn encoder_chunks() -> usize {
+    static CHUNKS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CHUNKS.get_or_init(|| {
+        std::env::var("BEVY_ENCODER_CHUNKS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| ComputeTaskPool::get().thread_num().max(1))
+    })
+}
+
+/// Merges each run of consecutive [`PendingCommandBuffer::Encoder`]s into at most
+/// [`encoder_chunks`] encoders with about the same number of source encoders each.
+#[cfg(not(target_arch = "wasm32"))]
+fn merge_encoders(commands: Vec<PendingCommandBuffer>) -> Vec<PendingCommandBuffer> {
+    let chunks = encoder_chunks();
+    if chunks == 0 {
+        return commands;
+    }
+    let mut out: Vec<PendingCommandBuffer> = Vec::with_capacity(commands.len());
+    let mut run: Vec<PendingCommandBuffer> = Vec::new();
+    let flush = |run: &mut Vec<PendingCommandBuffer>, out: &mut Vec<PendingCommandBuffer>| {
+        if run.len() <= 1 {
+            out.append(run);
+            return;
+        }
+        let per_chunk = run.len().div_ceil(chunks);
+        let mut head: Option<PendingCommandBuffer> = None;
+        let mut in_head = 0;
+        for command in run.drain(..) {
+            let PendingCommandBuffer::Encoder { encoder, .. } = command else {
+                unreachable!()
+            };
+            match &mut head {
+                Some(PendingCommandBuffer::Encoder { encoder: dst, .. }) if in_head < per_chunk => {
+                    match dst.append(encoder) {
+                        Ok(()) => in_head += 1,
+                        Err(encoder) => {
+                            // Could not merge (e.g. invalid encoder): keep both, in order.
+                            out.push(head.take().unwrap());
+                            head = Some(PendingCommandBuffer::Encoder {
+                                encoder,
+                                #[cfg(feature = "trace")]
+                                name: "merged".into(),
+                            });
+                            in_head = 1;
+                        }
+                    }
+                }
+                _ => {
+                    if let Some(h) = head.take() {
+                        out.push(h);
+                    }
+                    head = Some(PendingCommandBuffer::Encoder {
+                        encoder,
+                        #[cfg(feature = "trace")]
+                        name: "merged".into(),
+                    });
+                    in_head = 1;
+                }
+            }
+        }
+        if let Some(h) = head.take() {
+            out.push(h);
+        }
+    };
+    for command in commands {
+        match command {
+            PendingCommandBuffer::Encoder { .. } => run.push(command),
+            PendingCommandBuffer::Buffer(_) => {
+                flush(&mut run, &mut out);
+                out.push(command);
+            }
+        }
+    }
+    flush(&mut run, &mut out);
+    out
 }
 
 #[derive(Default)]

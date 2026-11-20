@@ -51,8 +51,8 @@ use bevy_render::{
     renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery},
     sync_world::{MainEntity, MainEntityHashMap, MainEntityHashSet},
     view::{
-        ExtractedView, NoIndirectDrawing, RenderVisibilityRanges, RenderVisibleEntities,
-        RetainedViewEntity, ViewDepthStencilTexture, ViewTarget,
+        ExtractedView, NoIndirectDrawing, NoTransientMsaa, RenderVisibilityRanges,
+        RenderVisibleEntities, RetainedViewEntity, ViewDepthStencilTexture, ViewTarget,
     },
     Extract, ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderDebugFlags,
     RenderStartup, RenderSystems,
@@ -99,6 +99,8 @@ impl Plugin for WireframePlugin {
         .init_resource::<WireframeEntitiesNeedingSpecialization>()
         .register_type::<WireframeLineWidth>()
         .register_type::<WireframeTopology>()
+        // `wireframe_3d` loads the multisampled attachments after the main pass.
+        .register_required_components::<Camera3d, NoTransientMsaa>()
         .add_systems(Startup, setup_global_wireframe_material)
         .add_systems(
             PostUpdate,

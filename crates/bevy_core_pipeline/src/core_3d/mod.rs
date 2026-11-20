@@ -43,7 +43,9 @@ use bevy_render::{
     occlusion_culling::OcclusionCulling,
     render_phase::{PhaseItemBatchSetKey, ViewRangefinder3d},
     texture::{CachedTexture, DepthStencilAttachment},
-    view::{prepare_view_targets, NoIndirectDrawing, RetainedViewEntity},
+    view::{
+        prepare_view_targets, NoIndirectDrawing, NoTransientMsaa, RetainedViewEntity, TransientMsaa,
+    },
 };
 use indexmap::IndexMap;
 pub use main_merged_pass_3d::*;
@@ -181,7 +183,10 @@ impl Plugin for Core3dPlugin {
             .init_resource::<ViewBinnedRenderPhases<AlphaMask3dDeferred>>()
             .init_resource::<ViewSortedRenderPhases<Transparent3d>>()
             .add_systems(ExtractSchedule, extract_core_3d_camera_phases)
-            .add_systems(ExtractSchedule, extract_camera_prepass_phase)
+            .add_systems(
+                ExtractSchedule,
+                (extract_camera_prepass_phase, extract_transient_msaa_3d),
+            )
             .add_systems(
                 Render,
                 (
@@ -596,6 +601,28 @@ pub fn extract_core_3d_camera_phases(
     transparent_3d_phases.retain(|view_entity, _| live_entities.contains(view_entity));
 }
 
+/// Inserts [`TransientMsaa`] on the render-world view of every 3D camera that has it and no
+/// [`NoTransientMsaa`] while [`Core3dMainPassMode::Merged`] is in use, and removes it otherwise.
+pub fn extract_transient_msaa_3d(
+    mut commands: Commands,
+    main_pass_mode: Extract<Res<Core3dMainPassMode>>,
+    cameras_3d: Extract<
+        Query<(RenderEntity, Has<TransientMsaa>, Has<NoTransientMsaa>), With<Camera3d>>,
+    >,
+) {
+    let merged = matches!(**main_pass_mode, Core3dMainPassMode::Merged);
+    for (entity, transient_msaa, no_transient_msaa) in &cameras_3d {
+        let Ok(mut entity) = commands.get_entity(entity) else {
+            continue;
+        };
+        if merged && transient_msaa && !no_transient_msaa {
+            entity.insert(TransientMsaa);
+        } else {
+            entity.remove::<TransientMsaa>();
+        }
+    }
+}
+
 // Extract the render phases for the prepass
 
 pub fn extract_camera_prepass_phase(
@@ -734,10 +761,15 @@ pub fn prepare_core_3d_depth_textures(
         Option<&DepthPrepass>,
         &Camera3d,
         &Msaa,
+        Has<TransientMsaa>,
+        Has<NormalPrepass>,
+        Has<MotionVectorPrepass>,
+        Has<DeferredPrepass>,
     )>,
 ) {
     let mut render_target_usage = <HashMap<_, _>>::default();
-    for (_, camera, depth_prepass, camera_3d, _msaa) in &views_3d {
+    let mut views_per_texture = <HashMap<_, usize>>::default();
+    for (_, camera, depth_prepass, camera_3d, msaa, ..) in &views_3d {
         // Default usage required to write to the depth texture
         let mut usage: TextureUsages = camera_3d.depth_texture_usages.into();
         if depth_prepass.is_some() {
@@ -748,10 +780,24 @@ pub fn prepare_core_3d_depth_textures(
             .entry(camera.target.clone())
             .and_modify(|u| *u |= usage)
             .or_insert_with(|| usage);
+        *views_per_texture
+            .entry((camera.target.clone(), *msaa))
+            .or_default() += 1;
     }
 
     let mut textures = <HashMap<_, _>>::default();
-    for (entity, camera, _, camera_3d, msaa) in &views_3d {
+    for (
+        entity,
+        camera,
+        depth_prepass,
+        camera_3d,
+        msaa,
+        transient_msaa,
+        normal_prepass,
+        motion_vector_prepass,
+        deferred_prepass,
+    ) in &views_3d
+    {
         let Some(physical_target_size) = camera.physical_target_size else {
             continue;
         };
@@ -759,9 +805,25 @@ pub fn prepare_core_3d_depth_textures(
         let cached_texture = textures
             .entry((camera.target.clone(), msaa))
             .or_insert_with(|| {
-                let usage = *render_target_usage
+                let mut usage = *render_target_usage
                     .get(&camera.target.clone())
                     .expect("The depth texture usage should already exist for this target");
+
+                // The merged main pass of this view is the only pass that uses this depth
+                // texture: it clears it and nothing reads it afterwards.
+                let has_prepass = depth_prepass.is_some()
+                    || normal_prepass
+                    || motion_vector_prepass
+                    || deferred_prepass;
+                if transient_msaa
+                    && msaa.samples() > 1
+                    && usage == TextureUsages::RENDER_ATTACHMENT
+                    && !has_prepass
+                    && views_per_texture[&(camera.target.clone(), *msaa)] == 1
+                    && matches!(camera_3d.depth_load_op, Camera3dDepthLoadOp::Clear(_))
+                {
+                    usage |= TextureUsages::TRANSIENT_ATTACHMENT;
+                }
 
                 let descriptor = TextureDescriptor {
                     label: Some("view_depth_texture"),

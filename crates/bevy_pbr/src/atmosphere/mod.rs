@@ -68,6 +68,7 @@ use bevy_render::{
 use bevy_render::{
     render_resource::{TextureFormat, TextureUsages},
     renderer::RenderAdapter,
+    view::NoTransientMsaa,
     GpuResourceAppExt, Render, RenderApp, RenderSystems,
 };
 use bevy_transform::components::GlobalTransform;
@@ -290,7 +291,8 @@ pub struct ExtractedAtmosphere {
 /// transmittance to that point (A channel).
 #[derive(Clone, Component, Reflect)]
 #[reflect(Clone, Default)]
-#[require(Hdr)]
+// `render_sky` draws into the multisampled color before the merged main pass loads it.
+#[require(Hdr, NoTransientMsaa)]
 pub struct AtmosphereSettings {
     /// The size of the transmittance LUT
     pub transmittance_lut_size: UVec2,

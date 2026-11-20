@@ -41,9 +41,9 @@ use bevy_render::{
         CachedRenderPipelineId, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
     },
     renderer::RenderDevice,
-    sync_world::MainEntity,
+    sync_world::{MainEntity, RenderEntity},
     texture::TextureCache,
-    view::{Msaa, ViewDepthStencilTexture},
+    view::{Msaa, NoTransientMsaa, TransientMsaa, ViewDepthStencilTexture},
     Extract, ExtractSchedule, Render, RenderApp, RenderSystems,
 };
 
@@ -121,7 +121,10 @@ impl Plugin for Core2dPlugin {
             .allow_ambiguous_resource::<ViewSortedRenderPhases<Transparent2d>>()
             .allow_ambiguous_resource::<ViewBinnedRenderPhases<Opaque2d>>()
             .allow_ambiguous_resource::<ViewBinnedRenderPhases<AlphaMask2d>>()
-            .add_systems(ExtractSchedule, extract_core_2d_camera_phases)
+            .add_systems(
+                ExtractSchedule,
+                (extract_core_2d_camera_phases, extract_transient_msaa_2d),
+            )
             .add_systems(
                 Render,
                 (
@@ -484,16 +487,52 @@ pub fn extract_core_2d_camera_phases(
     alpha_mask_2d_phases.retain(|camera_entity, _| live_entities.contains(camera_entity));
 }
 
+/// Inserts [`TransientMsaa`] on the render-world view of every 2D camera that has it and no
+/// [`NoTransientMsaa`] while [`Core2dMainPassMode::Merged`] is in use, and removes it otherwise.
+pub fn extract_transient_msaa_2d(
+    mut commands: Commands,
+    main_pass_mode: Extract<Res<Core2dMainPassMode>>,
+    cameras_2d: Extract<
+        Query<(RenderEntity, Has<TransientMsaa>, Has<NoTransientMsaa>), With<Camera2d>>,
+    >,
+) {
+    let merged = matches!(**main_pass_mode, Core2dMainPassMode::Merged);
+    for (entity, transient_msaa, no_transient_msaa) in &cameras_2d {
+        let Ok(mut entity) = commands.get_entity(entity) else {
+            continue;
+        };
+        if merged && transient_msaa && !no_transient_msaa {
+            entity.insert(TransientMsaa);
+        } else {
+            entity.remove::<TransientMsaa>();
+        }
+    }
+}
+
 pub fn prepare_core_2d_depth_textures(
     mut commands: Commands,
     mut texture_cache: ResMut<TextureCache>,
     render_device: Res<RenderDevice>,
     transparent_2d_phases: Res<ViewSortedRenderPhases<Transparent2d>>,
     opaque_2d_phases: Res<ViewBinnedRenderPhases<Opaque2d>>,
-    views_2d: Query<(Entity, &ExtractedCamera, &ExtractedView, &Msaa), (With<Camera2d>,)>,
+    views_2d: Query<
+        (
+            Entity,
+            &ExtractedCamera,
+            &ExtractedView,
+            &Msaa,
+            Has<TransientMsaa>,
+        ),
+        (With<Camera2d>,),
+    >,
 ) {
+    let mut views_per_texture = <HashMap<_, usize>>::default();
+    for (_, camera, ..) in &views_2d {
+        *views_per_texture.entry(camera.target.clone()).or_default() += 1;
+    }
+
     let mut textures = <HashMap<_, _>>::default();
-    for (view, camera, extracted_view, msaa) in &views_2d {
+    for (view, camera, extracted_view, msaa, transient_msaa) in &views_2d {
         if !opaque_2d_phases.contains_key(&extracted_view.retained_view_entity)
             || !transparent_2d_phases.contains_key(&extracted_view.retained_view_entity)
         {
@@ -507,6 +546,16 @@ pub fn prepare_core_2d_depth_textures(
         let cached_texture = textures
             .entry(camera.target.clone())
             .or_insert_with(|| {
+                // The merged main pass of this view is the only pass that uses this depth
+                // texture: it clears it and nothing reads it afterwards.
+                let usage = if transient_msaa
+                    && msaa.samples() > 1
+                    && views_per_texture[&camera.target] == 1
+                {
+                    TextureUsages::RENDER_ATTACHMENT | TextureUsages::TRANSIENT_ATTACHMENT
+                } else {
+                    TextureUsages::RENDER_ATTACHMENT
+                };
                 let descriptor = TextureDescriptor {
                     label: Some("view_depth_texture"),
                     // The size of the depth texture
@@ -515,7 +564,7 @@ pub fn prepare_core_2d_depth_textures(
                     sample_count: msaa.samples(),
                     dimension: TextureDimension::D2,
                     format: CORE_2D_DEPTH_FORMAT,
-                    usage: TextureUsages::RENDER_ATTACHMENT,
+                    usage,
                     view_formats: &[],
                 };
 

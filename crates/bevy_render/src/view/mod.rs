@@ -4,7 +4,7 @@ pub mod window;
 
 use bevy_camera::{
     primitives::Frustum, Camera, CameraMainTextureUsages, ClearColor, ClearColorConfig,
-    CompositingSpace, Exposure, MainPassResolutionOverride, NormalizedRenderTarget,
+    CompositingSpace, Exposure, MainPassResolutionOverride, MsaaWriteback, NormalizedRenderTarget,
 };
 use bevy_diagnostic::FrameCount;
 pub use composition::*;
@@ -269,6 +269,41 @@ impl Msaa {
         }
     }
 }
+
+/// Creates the multisampled main-pass attachments of a camera as transient attachments
+/// ([`TextureUsages::TRANSIENT_ATTACHMENT`]).
+///
+/// A transient attachment is cleared at the start of a render pass and discarded at its end,
+/// after the resolve. Tile-based GPUs can keep it in tile memory only (memoryless textures on
+/// Metal), which saves the memory and the bandwidth of the multisampled color and depth
+/// textures. Backends that do not benefit treat the flag as a no-op.
+///
+/// This only takes effect while the camera's core pipeline draws its whole main pass in one
+/// render pass (`Core2dMainPassMode::Merged` or `Core3dMainPassMode::Merged`), and only when
+/// MSAA is enabled. The multisampled color texture is transient when this camera is the only one
+/// rendering into its main texture, clears it, and does not use [`MsaaWriteback::Always`]. The
+/// multisampled depth texture is transient when its only usage is
+/// [`TextureUsages::RENDER_ATTACHMENT`], no prepass writes into it, the camera clears it and no
+/// other camera renders into it.
+///
+/// By adding this component you promise that no render pass other than the merged main pass
+/// loads or stores the multisampled attachments of this camera. Plugins with such passes add
+/// [`NoTransientMsaa`] to the affected cameras, for example the atmosphere and wireframe plugins.
+///
+/// In the render world, this component is present on a view only when it is in effect.
+#[derive(Component, Default, Clone, Copy, Reflect, PartialEq, Eq, Debug)]
+#[reflect(Component, Default, PartialEq, Debug)]
+pub struct TransientMsaa;
+
+/// Keeps the multisampled main-pass attachments of a camera in memory, even if it has
+/// [`TransientMsaa`].
+///
+/// Add this to a camera when a render pass other than the merged main pass needs its
+/// multisampled attachments, such as a pass that draws into
+/// [`ViewTarget::get_color_attachment`] before the main pass or loads it after the main pass.
+#[derive(Component, Default, Clone, Copy, Reflect, PartialEq, Eq, Debug)]
+#[reflect(Component, Default, PartialEq, Debug)]
+pub struct NoTransientMsaa;
 
 /// Optionally enables a tonemapping shader that attempts to map linear input stimulus into a perceptually uniform image for a given [`Camera`] entity.
 ///
@@ -1408,14 +1443,26 @@ pub fn prepare_view_targets(
         &CameraMainTextureUsages,
         &Msaa,
         Option<&ResolvedCompositingSpace>,
+        Has<TransientMsaa>,
     )>,
     view_target_attachments: Res<ViewTargetAttachments>,
     mut main_texture_atomics: Local<HashMap<MainTextureKey, Weak<AtomicUsize>>>,
 ) {
     main_texture_atomics.retain(|_, weak| weak.strong_count() > 0);
 
+    // A transient multisampled texture can't be shared: each view's main pass would clear it and
+    // discard it at the end.
+    let mut views_per_key = <HashMap<MainTextureKey, usize>>::default();
+    for (_, camera, view, texture_usage, msaa, ..) in cameras.iter() {
+        *views_per_key
+            .entry(main_texture_key(camera, view, texture_usage, *msaa))
+            .or_default() += 1;
+    }
+
     let mut textures = <HashMap<_, _>>::default();
-    for (entity, camera, view, texture_usage, msaa, resolved_space) in cameras.iter() {
+    for (entity, camera, view, texture_usage, msaa, resolved_space, transient_msaa) in
+        cameras.iter()
+    {
         let Some(target_size) = camera.physical_target_size else {
             // If we don't have a target size, we can't create the main texture and have to bail
             commands.entity(entity).try_remove::<ViewTarget>();
@@ -1453,6 +1500,17 @@ pub fn prepare_view_targets(
             });
 
         let key = main_texture_key(camera, view, texture_usage, *msaa);
+        // A transient texture must be cleared by the only pass that uses it, so MSAA writeback
+        // can't fill it first.
+        let sampled_usage = if transient_msaa
+            && views_per_key[&key] == 1
+            && clear_color.is_some()
+            && camera.msaa_writeback != MsaaWriteback::Always
+        {
+            TextureUsages::RENDER_ATTACHMENT | TextureUsages::TRANSIENT_ATTACHMENT
+        } else {
+            TextureUsages::RENDER_ATTACHMENT
+        };
         let (a, b, sampled, main_texture) = textures.entry(key.clone()).or_insert_with(|| {
             let descriptor = TextureDescriptor {
                 label: None,
@@ -1492,7 +1550,7 @@ pub fn prepare_view_targets(
                         sample_count: msaa.samples(),
                         dimension: TextureDimension::D2,
                         format: main_texture_format,
-                        usage: TextureUsages::RENDER_ATTACHMENT,
+                        usage: sampled_usage,
                         view_formats: descriptor.view_formats,
                     },
                 );

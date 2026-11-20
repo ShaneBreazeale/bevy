@@ -1,11 +1,11 @@
 use super::CachedTexture;
-use crate::render_resource::{TextureFormat, TextureView};
+use crate::render_resource::{Texture, TextureFormat, TextureView};
 use alloc::sync::Arc;
 use bevy_color::LinearRgba;
 use core::sync::atomic::{AtomicBool, Ordering};
 use wgpu::{
     Color as WgpuColor, LoadOp, Operations, RenderPassColorAttachment,
-    RenderPassDepthStencilAttachment, StoreOp, TextureViewDescriptor,
+    RenderPassDepthStencilAttachment, StoreOp, TextureUsages, TextureViewDescriptor,
 };
 
 /// A wrapper for a [`CachedTexture`] that is used as a [`RenderPassColorAttachment`].
@@ -37,7 +37,9 @@ impl ColorAttachment {
     /// Get this texture view as an attachment. The attachment will be cleared with a value of
     /// `clear_color` if this is the first time calling this function, otherwise it will be loaded.
     ///
-    /// The returned attachment will always have writing enabled (`store: StoreOp::Load`).
+    /// The returned attachment will always have writing enabled (`store: StoreOp::Load`), except
+    /// for a multisampled texture with [`TextureUsages::TRANSIENT_ATTACHMENT`] usage, which is
+    /// resolved and then discarded (`store: StoreOp::Discard`).
     pub fn get_attachment(&self) -> RenderPassColorAttachment<'_> {
         if let Some(resolve_target) = self.resolve_target.as_ref() {
             let first_call = self.is_first_call.fetch_and(false, Ordering::SeqCst);
@@ -51,7 +53,7 @@ impl ColorAttachment {
                         (Some(clear_color), true) => LoadOp::Clear(clear_color),
                         (None, _) | (Some(_), false) => LoadOp::Load,
                     },
-                    store: StoreOp::Store,
+                    store: transient_store_op(&resolve_target.texture, StoreOp::Store),
                 },
             }
         } else {
@@ -82,6 +84,18 @@ impl ColorAttachment {
 
     pub(crate) fn mark_as_cleared(&self) {
         self.is_first_call.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Transient attachments can't be stored, only discarded.
+fn transient_store_op(texture: &Texture, store: StoreOp) -> StoreOp {
+    if texture
+        .usage()
+        .contains(TextureUsages::TRANSIENT_ATTACHMENT)
+    {
+        StoreOp::Discard
+    } else {
+        store
     }
 }
 
@@ -234,8 +248,19 @@ impl DepthStencilAttachment {
     /// Get this texture view as an attachment. The attachment will be cleared with a value of
     /// `clear_value` if this is the first time calling this function with `store` == [`StoreOp::Store`],
     /// and a clear value was provided, otherwise it will be loaded.
+    ///
+    /// A texture with [`TextureUsages::TRANSIENT_ATTACHMENT`] usage is always discarded at the
+    /// end of the pass, whatever `store` is.
     pub fn get_attachment(&self, store: StoreOp) -> RenderPassDepthStencilAttachment<'_> {
-        self.depth_stencil_view_attachment.get_attachment(store)
+        let mut attachment = self.depth_stencil_view_attachment.get_attachment(store);
+        let store = transient_store_op(&self.texture.texture, store);
+        for ops in attachment.depth_ops.iter_mut() {
+            ops.store = store;
+        }
+        for ops in attachment.stencil_ops.iter_mut() {
+            ops.store = store;
+        }
+        attachment
     }
 
     /// Marks this depth attachment as unused this frame so that it'll be
@@ -442,5 +467,95 @@ impl OutputColorAttachment {
     // are always consumed by a render pass that writes to the attachment
     pub fn needs_present(&self) -> bool {
         !self.is_first_call.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{renderer::RenderDevice, test_utils::create_dummy_device};
+    use bevy_platform::future::block_on;
+    use wgpu::{
+        CommandEncoderDescriptor, ErrorFilter, Extent3d, RenderPassDescriptor, TextureDescriptor,
+        TextureDimension,
+    };
+
+    fn cached_texture(
+        device: &RenderDevice,
+        format: TextureFormat,
+        sample_count: u32,
+        usage: TextureUsages,
+    ) -> CachedTexture {
+        let texture = device.create_texture(&TextureDescriptor {
+            label: None,
+            size: Extent3d {
+                width: 64,
+                height: 64,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count,
+            dimension: TextureDimension::D2,
+            format,
+            usage,
+            view_formats: &[],
+        });
+        let default_view = texture.create_view(&TextureViewDescriptor::default());
+        CachedTexture {
+            texture,
+            default_view,
+        }
+    }
+
+    /// A pass over transient multisampled attachments must clear them and discard them.
+    #[test]
+    fn transient_msaa_attachments_are_discarded() {
+        let (device, queue) = create_dummy_device();
+        let transient = TextureUsages::RENDER_ATTACHMENT | TextureUsages::TRANSIENT_ATTACHMENT;
+        let color = ColorAttachment::new(
+            cached_texture(
+                &device,
+                TextureFormat::Rgba8Unorm,
+                1,
+                TextureUsages::RENDER_ATTACHMENT,
+            ),
+            Some(cached_texture(
+                &device,
+                TextureFormat::Rgba8Unorm,
+                4,
+                transient,
+            )),
+            None,
+            Some(WgpuColor::BLACK),
+        );
+        let depth = DepthStencilAttachment::new(
+            cached_texture(&device, TextureFormat::Depth32Float, 4, transient),
+            None,
+            Some(0.0),
+            None,
+        );
+
+        let color_attachment = color.get_attachment();
+        assert_eq!(color_attachment.ops.store, StoreOp::Discard);
+        let depth_attachment = depth.get_attachment(StoreOp::Store);
+        assert_eq!(
+            depth_attachment.depth_ops.map(|ops| ops.store),
+            Some(StoreOp::Discard)
+        );
+
+        let scope = device
+            .wgpu_device()
+            .push_error_scope(ErrorFilter::Validation);
+        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+        encoder.begin_render_pass(&RenderPassDescriptor {
+            label: None,
+            color_attachments: &[Some(color_attachment)],
+            depth_stencil_attachment: Some(depth_attachment),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        queue.submit([encoder.finish()]);
+        assert!(block_on(scope.pop()).is_none());
     }
 }

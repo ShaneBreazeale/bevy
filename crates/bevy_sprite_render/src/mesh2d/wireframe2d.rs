@@ -46,8 +46,8 @@ use bevy_render::{
     renderer::{RenderContext, ViewQuery},
     sync_world::{MainEntity, MainEntityHashMap, MainEntityHashSet},
     view::{
-        ExtractedView, RenderVisibleEntities, RetainedViewEntity, ViewDepthStencilTexture,
-        ViewTarget,
+        ExtractedView, NoTransientMsaa, RenderVisibleEntities, RetainedViewEntity,
+        ViewDepthStencilTexture, ViewTarget,
     },
     Extract, ExtractSchedule, GpuResourceAppExt, Render, RenderApp, RenderDebugFlags,
     RenderStartup, RenderSystems,
@@ -90,6 +90,8 @@ impl Plugin for Wireframe2dPlugin {
         .init_resource::<SpecializedMeshPipelines<Wireframe2dPipeline>>()
         .init_resource::<Wireframe2dConfig>()
         .init_resource::<WireframeEntitiesNeedingSpecialization>()
+        // `wireframe_2d` loads the multisampled attachments after the main pass.
+        .register_required_components::<Camera2d, NoTransientMsaa>()
         .add_systems(Startup, setup_global_wireframe_material)
         .add_systems(
             Update,

@@ -113,11 +113,38 @@ fn finish_sequential(
 
 /// Finishes pending command encoders in parallel on the [`ComputeTaskPool`],
 /// then reassembles the command buffers in their original order.
+///
+/// Every render system (and view) records into its own encoder, so a frame
+/// would otherwise submit one command buffer per system and view; on Metal each
+/// is at least one `MTLCommandBuffer` with its own creation, commit and
+/// completion cost. Before finishing, each run of consecutive encoders is merged
+/// into at most one encoder per compute thread with [`CommandEncoder::append`],
+/// so finishing still runs in parallel. Submission order is unchanged.
 #[cfg(not(target_arch = "wasm32"))]
 fn finish_parallel(
     commands: impl Iterator<Item = PendingCommandBuffer>,
 ) -> impl Iterator<Item = CommandBuffer> {
-    let mut command_buffers = Vec::with_capacity(commands.size_hint().0);
+    let chunks = ComputeTaskPool::get().thread_num().max(1);
+    let commands = merge_encoder_runs(commands.collect(), chunks, |dst, src| {
+        let (
+            PendingCommandBuffer::Encoder { encoder: dst, .. },
+            PendingCommandBuffer::Encoder {
+                encoder: src,
+                #[cfg(feature = "trace")]
+                name,
+            },
+        ) = (dst, src)
+        else {
+            unreachable!("only encoders are merged")
+        };
+        dst.append(src)
+            .map_err(|encoder| PendingCommandBuffer::Encoder {
+                encoder,
+                #[cfg(feature = "trace")]
+                name,
+            })
+    });
+    let mut command_buffers = Vec::with_capacity(commands.len());
     let mut finished_encoders = ComputeTaskPool::get().scope(|scope| {
         for (index, command) in commands.into_iter().enumerate() {
             match command {
@@ -145,6 +172,64 @@ fn finish_parallel(
     command_buffers
         .into_iter()
         .map(|(_, command_buffer)| command_buffer)
+}
+
+/// Something [`merge_encoder_runs`] can merge.
+#[cfg(any(test, not(target_arch = "wasm32")))]
+trait Mergeable {
+    /// Whether this item can absorb, or be absorbed by, a neighbour.
+    fn is_mergeable(&self) -> bool;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Mergeable for PendingCommandBuffer {
+    fn is_mergeable(&self) -> bool {
+        matches!(self, PendingCommandBuffer::Encoder { .. })
+    }
+}
+
+/// Merges each run of consecutive mergeable items into at most `chunks` items,
+/// about the same number of source items each, keeping their order. `append`
+/// moves `src` to the end of `dst`, or hands `src` back if it cannot; the item
+/// it hands back then starts the next merged item.
+#[cfg(any(test, not(target_arch = "wasm32")))]
+fn merge_encoder_runs<T: Mergeable>(
+    items: Vec<T>,
+    chunks: usize,
+    mut append: impl FnMut(&mut T, T) -> Result<(), T>,
+) -> Vec<T> {
+    let mut out = Vec::with_capacity(items.len());
+    let mut run: Vec<T> = Vec::new();
+    let mut flush = |run: &mut Vec<T>, out: &mut Vec<T>| {
+        let per_chunk = run.len().div_ceil(chunks.max(1));
+        let mut head: Option<(T, usize)> = None;
+        for item in run.drain(..) {
+            head = match head.take() {
+                Some((mut dst, n)) if n < per_chunk => match append(&mut dst, item) {
+                    Ok(()) => Some((dst, n + 1)),
+                    Err(item) => {
+                        out.push(dst);
+                        Some((item, 1))
+                    }
+                },
+                previous => {
+                    out.extend(previous.map(|(dst, _)| dst));
+                    Some((item, 1))
+                }
+            };
+        }
+        out.extend(head.map(|(dst, _)| dst));
+    };
+    for item in items {
+        if item.is_mergeable() {
+            run.push(item);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(item);
+        }
+    }
+    flush(&mut run, &mut out);
+    out
 }
 
 #[derive(Default)]
@@ -407,4 +492,103 @@ unsafe impl<'a, D: QueryData + 'static, F: QueryFilter + 'static> SystemParam
 unsafe impl<'w, 's, D: bevy_ecs::query::ReadOnlyQueryData + 'static, F: QueryFilter + 'static>
     bevy_ecs::system::ReadOnlySystemParam for ViewQuery<'w, 's, D, F>
 {
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{merge_encoder_runs, Mergeable};
+    use alloc::{vec, vec::Vec};
+
+    /// An encoder stand-in: the ids of the source encoders it holds, in order.
+    /// `Fixed` items are finished command buffers, which never merge.
+    #[derive(Debug, PartialEq)]
+    enum Item {
+        Encoder(Vec<u32>),
+        Fixed(u32),
+    }
+
+    impl Mergeable for Item {
+        fn is_mergeable(&self) -> bool {
+            matches!(self, Item::Encoder(_))
+        }
+    }
+
+    fn encoders(ids: core::ops::Range<u32>) -> Vec<Item> {
+        ids.map(|id| Item::Encoder(vec![id])).collect()
+    }
+
+    fn append(dst: &mut Item, src: Item) -> Result<(), Item> {
+        match (dst, src) {
+            (Item::Encoder(dst), Item::Encoder(src)) => {
+                dst.extend(src);
+                Ok(())
+            }
+            (_, src) => Err(src),
+        }
+    }
+
+    #[test]
+    fn a_run_is_split_into_chunks_in_order() {
+        let merged = merge_encoder_runs(encoders(0..10), 4, append);
+        assert_eq!(
+            merged,
+            vec![
+                Item::Encoder(vec![0, 1, 2]),
+                Item::Encoder(vec![3, 4, 5]),
+                Item::Encoder(vec![6, 7, 8]),
+                Item::Encoder(vec![9]),
+            ]
+        );
+    }
+
+    #[test]
+    fn finished_buffers_split_runs_and_keep_their_place() {
+        let mut items = encoders(0..3);
+        items.push(Item::Fixed(100));
+        items.extend(encoders(3..5));
+        let merged = merge_encoder_runs(items, 1, append);
+        assert_eq!(
+            merged,
+            vec![
+                Item::Encoder(vec![0, 1, 2]),
+                Item::Fixed(100),
+                Item::Encoder(vec![3, 4]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_refused_append_starts_the_next_chunk() {
+        // Encoder 2 cannot be absorbed (for example it is invalid).
+        let refuse_2 = |dst: &mut Item, src: Item| match &src {
+            Item::Encoder(ids) if ids == &vec![2] => Err(src),
+            _ => append(dst, src),
+        };
+        let merged = merge_encoder_runs(encoders(0..5), 1, refuse_2);
+        assert_eq!(
+            merged,
+            vec![Item::Encoder(vec![0, 1]), Item::Encoder(vec![2, 3, 4])]
+        );
+    }
+
+    #[test]
+    fn single_items_and_empty_input_pass_through() {
+        assert_eq!(merge_encoder_runs(Vec::<Item>::new(), 4, append), vec![]);
+        assert_eq!(
+            merge_encoder_runs(vec![Item::Fixed(7)], 4, append),
+            vec![Item::Fixed(7)]
+        );
+        assert_eq!(
+            merge_encoder_runs(encoders(0..1), 4, append),
+            vec![Item::Encoder(vec![0])]
+        );
+    }
+
+    #[test]
+    fn more_chunks_than_encoders_keeps_one_per_encoder() {
+        assert_eq!(
+            merge_encoder_runs(encoders(0..3), 8, append),
+            encoders(0..3)
+        );
+    }
 }

@@ -47,7 +47,7 @@ use crate::{
     },
     renderer::{RenderAdapter, RenderAdapterInfo, RenderDevice, RenderQueue},
     sync_world::{MainEntity, MainEntityHashMap},
-    view::{ExtractedView, NoIndirectDrawing, RetainedViewEntity},
+    view::{ExtractedView, NoIndirectDrawing, RetainedViewEntity, ReusedView},
     GpuResourceAppExt, Render, RenderApp, RenderDebugFlags, RenderSystems,
 };
 
@@ -563,6 +563,20 @@ pub enum PreprocessWorkItemBuffers {
         /// The work item buffers we use when GPU occlusion culling is in use.
         gpu_occlusion_culling: Option<GpuOcclusionCullingWorkItemBuffers>,
     },
+}
+
+impl PreprocessWorkItemBuffers {
+    /// Whether there is nothing to preprocess this frame.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            PreprocessWorkItemBuffers::Direct(work_items) => work_items.is_empty(),
+            PreprocessWorkItemBuffers::Indirect {
+                indexed,
+                non_indexed,
+                ..
+            } => indexed.is_empty() && non_indexed.is_empty(),
+        }
+    }
 }
 
 /// The work item buffers we use when GPU occlusion culling is in use.
@@ -2085,6 +2099,7 @@ pub fn batch_and_prepare_binned_render_phase<BPI, GFBD>(
             &ExtractedView,
             Has<NoIndirectDrawing>,
             Has<OcclusionCulling>,
+            Has<ReusedView>,
         ),
         With<ExtractedView>,
     >,
@@ -2123,7 +2138,7 @@ pub fn batch_and_prepare_binned_render_phase<BPI, GFBD>(
 
     // Prepare unbatchables and batchables.
 
-    for (extracted_view, no_indirect_drawing, gpu_occlusion_culling) in &mut views {
+    for (extracted_view, no_indirect_drawing, gpu_occlusion_culling, reused) in &mut views {
         let Some(phase) = binned_render_phases.get_mut(&extracted_view.retained_view_entity) else {
             continue;
         };
@@ -2143,6 +2158,11 @@ pub fn batch_and_prepare_binned_render_phase<BPI, GFBD>(
             late_indexed_indirect_parameters_buffer,
             late_non_indexed_indirect_parameters_buffer,
         );
+
+        // The buffers above stay allocated for the frame that draws this phase again.
+        if reused {
+            continue;
+        }
 
         // Prepare unbatchables.
 
@@ -2360,7 +2380,11 @@ pub fn batch_and_prepare_binned_render_phase<BPI, GFBD>(
 
     // Prepare multidrawables.
 
-    for (extracted_view, _, _) in &mut views {
+    for (extracted_view, _, _, reused) in &mut views {
+        if reused {
+            continue;
+        }
+
         // We should have created the work item buffer for the view in the loop
         // above.
         let (Some(phase), Some(work_item_buffer)) = (

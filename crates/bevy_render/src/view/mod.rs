@@ -919,6 +919,11 @@ impl From<ColorGrading> for ColorGradingUniform {
 #[derive(Component, Default)]
 pub struct NoIndirectDrawing;
 
+/// Render-world marker for a view whose output from an earlier frame is used as is. Its binned
+/// phases stay up to date, but nothing is batched, preprocessed or drawn for it this frame.
+#[derive(Component, Default)]
+pub struct ReusedView;
+
 impl ViewTarget {
     /// Retrieve this target's main texture's color attachment.
     pub fn get_color_attachment(&self) -> RenderPassColorAttachment<'_> {

@@ -2249,6 +2249,11 @@ pub fn prepare_preprocess_bind_groups(
                 continue;
             };
 
+            // Views and phases that aren't drawn this frame have no work items.
+            if work_item_buffers.is_empty() {
+                continue;
+            }
+
             // Create the `PreprocessBindGroupBuilder`.
             let preprocess_bind_group_builder = PreprocessBindGroupBuilder {
                 view: view_entity,
@@ -2334,6 +2339,8 @@ pub fn prepare_preprocess_bind_groups(
 
     // Create the bind groups we'll need for each dispatch of the bin unpacking
     // (`unpack_bins`) and uniform allocation (`allocate_uniforms`) shaders.
+    // Views and phases that aren't drawn this frame go through here too: they have no jobs, so this
+    // drops last frame's bind groups.
     for (_, view) in &views {
         create_bin_unpacking_bind_groups(
             &mut bin_unpacking_bind_groups,

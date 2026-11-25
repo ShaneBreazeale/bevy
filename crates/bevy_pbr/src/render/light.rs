@@ -55,7 +55,7 @@ use bevy_render::{
     batching::gpu_preprocessing::{GpuPreprocessingMode, GpuPreprocessingSupport},
     camera::SortedCameras,
     mesh::allocator::MeshAllocator,
-    view::{NoIndirectDrawing, RetainedViewEntity},
+    view::{NoIndirectDrawing, RetainedViewEntity, ReusedView},
 };
 use bevy_render::{
     mesh::RenderMesh,
@@ -998,6 +998,43 @@ pub struct PointAndSpotLightViewEntities(Vec<Entity>);
 pub struct ShadowView {
     pub depth_attachment: DepthStencilViewAttachment,
     pub pass_name: String,
+    /// The shadow map still holds this view's depth from an earlier frame, so its pass is skipped.
+    pub reuse_depth: bool,
+}
+
+/// The cascade view and matrix that each layer of the directional shadow map was last drawn with.
+///
+/// Every camera view starts again at layer 0, so with several cameras a layer can hold another
+/// camera's depth.
+#[derive(Deref)]
+pub struct ShadowLayerContents<T = TextureId>(HashMap<(T, u32), (RetainedViewEntity, Mat4)>);
+
+impl<T> Default for ShadowLayerContents<T> {
+    fn default() -> Self {
+        Self(HashMap::default())
+    }
+}
+
+impl<T: Copy + Eq + Hash> ShadowLayerContents<T> {
+    /// Returns whether a `kept` cascade's depth is still in this layer. Otherwise the caller draws
+    /// it there, and that is recorded.
+    fn reuse_or_record(
+        &mut self,
+        texture: T,
+        layer: u32,
+        view: RetainedViewEntity,
+        clip_from_world: Mat4,
+        kept: bool,
+    ) -> bool {
+        let previous = self.0.insert((texture, layer), (view, clip_from_world));
+        kept && previous == Some((view, clip_from_world))
+    }
+
+    /// Forgets other textures and dead views.
+    fn retain(&mut self, texture: T, is_live: impl Fn(&RetainedViewEntity) -> bool) {
+        self.0
+            .retain(|(t, _), (view, _)| *t == texture && is_live(view));
+    }
 }
 
 #[derive(Component)]
@@ -1075,11 +1112,13 @@ pub fn prepare_lights(
         mut max_rect_lights_warning_emitted,
         mut max_cascades_per_light_warning_emitted,
         mut live_shadow_mapping_lights,
+        mut shadow_layer_contents,
     ): (
         Local<bool>,
         Local<bool>,
         Local<bool>,
         Local<HashSet<RetainedViewEntity>>,
+        Local<ShadowLayerContents>,
     ),
     (
         mut point_lights,
@@ -1980,6 +2019,7 @@ pub fn prepare_lights(
                     None,
                 );
 
+                let layer = directional_depth_texture_array_index;
                 directional_depth_texture_array_index += 1;
 
                 let mut frustum = *frustum;
@@ -1996,8 +2036,18 @@ pub fn prepare_lights(
                     cascade_index as u32,
                 );
 
+                // Skip a kept cascade only if its depth is still where it was drawn.
+                let reuse_depth = shadow_layer_contents.reuse_or_record(
+                    directional_light_depth_texture.texture.id(),
+                    layer,
+                    retained_view_entity,
+                    cascade.clip_from_world,
+                    cascade.reused && !light.occlusion_culling,
+                );
+
                 commands.entity(view_light_entity).insert((
                     ShadowView {
+                        reuse_depth,
                         depth_attachment,
                         pass_name: format!(
                             "shadow_directional_light_{light_index}_cascade_{cascade_index}"
@@ -2025,6 +2075,12 @@ pub fn prepare_lights(
                     },
                     (*light_render_layers).clone(),
                 ));
+
+                if reuse_depth {
+                    commands.entity(view_light_entity).insert(ReusedView);
+                } else {
+                    commands.entity(view_light_entity).remove::<ReusedView>();
+                }
 
                 if !matches!(gpu_preprocessing_mode, GpuPreprocessingMode::Culling) {
                     commands.entity(view_light_entity).insert(NoIndirectDrawing);
@@ -2122,6 +2178,9 @@ pub fn prepare_lights(
         }
     }
 
+    shadow_layer_contents.retain(directional_light_depth_texture.texture.id(), |view| {
+        live_shadow_mapping_lights.contains(view)
+    });
     shadow_render_phases.retain(|entity, _| live_shadow_mapping_lights.contains(entity));
     light_key_cache.retain(|entity, _| live_shadow_mapping_lights.contains(entity));
     specialized_shadow_material_pipeline_cache
@@ -2208,6 +2267,7 @@ fn create_point_shadow_maps(
 
         commands.entity(view_light_entity).insert((
             ShadowView {
+                reuse_depth: false,
                 depth_attachment,
                 pass_name: format!(
                     "shadow_point_light_{}_{}",
@@ -2306,6 +2366,7 @@ fn create_spot_shadow_map(
     let retained_view_entity = RetainedViewEntity::new(*light_main_entity, None, 0);
     commands.entity(view_light_entity).insert((
         ShadowView {
+            reuse_depth: false,
             depth_attachment,
             pass_name: format!("shadow_spot_light_{light_index}"),
         },
@@ -2980,6 +3041,9 @@ pub fn per_view_shadow_pass<const IS_LATE: bool>(
         else {
             continue;
         };
+        if view_light.reuse_depth {
+            continue;
+        }
 
         // Make sure to build indirect parameters here, as the normal
         // `*_prepass_build_indirect_parameters` functions only run for root
@@ -3160,5 +3224,67 @@ pub fn extract_shadow_lod_origin(
             render_shadow_lod_origin.0 = global_transform.translation();
         }
         None => render_shadow_lod_origin.0 = Default::default(),
+    }
+}
+
+#[cfg(test)]
+mod shadow_layer_tests {
+    use super::*;
+
+    const TEXTURE: u32 = 7;
+
+    fn view(camera: u32) -> RetainedViewEntity {
+        let camera = Entity::from_raw_u32(camera).unwrap();
+        RetainedViewEntity::new(Entity::PLACEHOLDER.into(), Some(camera.into()), 2)
+    }
+
+    #[test]
+    fn a_kept_cascade_is_reused_only_where_it_was_drawn() {
+        let mut layers = ShadowLayerContents::<u32>::default();
+        let (a, m) = (view(1), Mat4::IDENTITY);
+        assert!(
+            !layers.reuse_or_record(TEXTURE, 2, a, m, true),
+            "nothing drawn yet"
+        );
+        assert!(layers.reuse_or_record(TEXTURE, 2, a, m, true));
+        assert!(
+            !layers.reuse_or_record(TEXTURE, 2, a, m, false),
+            "not a kept cascade"
+        );
+        assert!(
+            !layers.reuse_or_record(TEXTURE, 3, a, m, true),
+            "another layer"
+        );
+        assert!(
+            !layers.reuse_or_record(TEXTURE + 1, 2, a, m, true),
+            "another texture"
+        );
+        assert!(
+            !layers.reuse_or_record(TEXTURE, 2, a, Mat4::ZERO, true),
+            "another matrix"
+        );
+    }
+
+    /// Every view starts again at layer 0, so a second camera overwrites the first one's layers.
+    #[test]
+    fn a_layer_overwritten_by_another_view_is_not_reused() {
+        let mut layers = ShadowLayerContents::<u32>::default();
+        let (a, b, m) = (view(1), view(2), Mat4::IDENTITY);
+        for _ in 0..3 {
+            assert!(!layers.reuse_or_record(TEXTURE, 2, a, m, true));
+            assert!(!layers.reuse_or_record(TEXTURE, 2, b, m, true));
+        }
+    }
+
+    #[test]
+    fn dead_views_and_old_textures_are_forgotten() {
+        let mut layers = ShadowLayerContents::<u32>::default();
+        let (a, b, m) = (view(1), view(2), Mat4::IDENTITY);
+        layers.reuse_or_record(TEXTURE, 2, a, m, false);
+        layers.reuse_or_record(TEXTURE, 3, b, m, false);
+        layers.reuse_or_record(TEXTURE + 1, 2, a, m, false);
+        layers.retain(TEXTURE, |view| *view == a);
+        assert_eq!(layers.len(), 1);
+        assert!(layers.reuse_or_record(TEXTURE, 2, a, m, true));
     }
 }

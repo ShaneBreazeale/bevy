@@ -167,6 +167,9 @@ where
     /// The gpu preprocessing mode configured for the view this phase is associated
     /// with.
     gpu_preprocessing_mode: GpuPreprocessingMode,
+
+    /// Whether the phase is left out of this frame. See [`Self::suspend`].
+    suspended: bool,
 }
 
 /// All entities that share a mesh and a material and can be batched as part of
@@ -1416,7 +1419,23 @@ where
             && self.non_mesh_items.is_empty()
     }
 
+    /// Leaves this phase out of the current frame: nothing is batched, preprocessed or drawn for
+    /// it. Its bins stay up to date, so it can be drawn again in any later frame.
+    ///
+    /// Call this between [`RenderSystems::Queue`] and
+    /// [`RenderSystems::PrepareResourcesBatchPhases`], in every frame the phase should be left
+    /// out. The code that draws the phase has to check [`Self::is_suspended`].
+    pub fn suspend(&mut self) {
+        self.suspended = true;
+    }
+
+    /// Whether [`Self::suspend`] was called this frame.
+    pub fn is_suspended(&self) -> bool {
+        self.suspended
+    }
+
     pub fn prepare_for_new_frame(&mut self) {
+        self.suspended = false;
         self.batch_sets.clear();
 
         for unbatchable_bin in self.unbatchable_meshes.values_mut() {
@@ -1544,6 +1563,7 @@ where
             },
             cached_entity_bin_keys: MainEntityHashMap::default(),
             gpu_preprocessing_mode: gpu_preprocessing,
+            suspended: false,
         }
     }
 }

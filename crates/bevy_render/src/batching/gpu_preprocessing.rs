@@ -2160,7 +2160,7 @@ pub fn batch_and_prepare_binned_render_phase<BPI, GFBD>(
         );
 
         // The buffers above stay allocated for the frame that draws this phase again.
-        if reused {
+        if reused || phase.is_suspended() {
             continue;
         }
 
@@ -2393,6 +2393,9 @@ pub fn batch_and_prepare_binned_render_phase<BPI, GFBD>(
         ) else {
             continue;
         };
+        if phase.is_suspended() {
+            continue;
+        }
 
         // Only process multidrawables if we're drawing with multidraw indirect
         // in the first place.

@@ -10,7 +10,10 @@ use bevy_render::{
     render_phase::ViewBinnedRenderPhases,
     render_resource::{PipelineCache, RenderPassDescriptor, StoreOp},
     renderer::{RenderContext, ViewQuery},
-    view::{ExtractedView, NoIndirectDrawing, ViewDepthStencilTexture, ViewUniformOffset},
+    view::{
+        ExtractedView, MainPassLayout, NoIndirectDrawing, ViewDepthStencilTexture,
+        ViewUniformOffset,
+    },
 };
 
 use crate::prepass::background_motion_vectors::{
@@ -18,8 +21,8 @@ use crate::prepass::background_motion_vectors::{
 };
 
 use super::{
-    AlphaMask3dPrepass, DeferredPrepass, Opaque3dPrepass, PreviousViewUniformOffset,
-    ViewPrepassTextures,
+    AlphaMask3dPrepass, DeferredPrepass, MainPassDepthPrepass, Opaque3dPrepass,
+    PreviousViewUniformOffset, ViewPrepassTextures,
 };
 
 /// Type alias for the prepass view query.
@@ -39,6 +42,10 @@ type PrepassViewQueryData = (
         Option<&'static MainPassResolutionOverride>,
     ),
     (Has<OcclusionCulling>, Has<NoIndirectDrawing>),
+    (
+        Option<&'static MainPassDepthPrepass>,
+        Option<&'static MainPassLayout>,
+    ),
 );
 
 pub fn early_prepass(
@@ -60,6 +67,7 @@ pub fn early_prepass(
             resolution_override,
         ),
         (_, _),
+        (main_pass_depth_prepass, layout),
     ) = view.into_inner();
 
     run_prepass_system(
@@ -80,6 +88,7 @@ pub fn early_prepass(
         &pipeline_cache,
         &mut ctx,
         "early prepass",
+        MainPassDepthPrepass::skips_copy(main_pass_depth_prepass, layout),
     );
 }
 
@@ -102,6 +111,7 @@ pub fn late_prepass(
             resolution_override,
         ),
         (occlusion_culling, no_indirect_drawing),
+        (main_pass_depth_prepass, layout),
     ) = view.into_inner();
 
     if !occlusion_culling || no_indirect_drawing {
@@ -126,6 +136,7 @@ pub fn late_prepass(
         &pipeline_cache,
         &mut ctx,
         "late prepass",
+        MainPassDepthPrepass::skips_copy(main_pass_depth_prepass, layout),
     );
 }
 
@@ -152,6 +163,7 @@ fn run_prepass_system(
     pipeline_cache: &PipelineCache,
     ctx: &mut RenderContext,
     label: &'static str,
+    skip_depth_copy: bool,
 ) {
     let (Some(opaque_prepass_phase), Some(alpha_mask_prepass_phase)) = (
         opaque_prepass_phases.get(&extracted_view.retained_view_entity),
@@ -203,7 +215,7 @@ fn run_prepass_system(
         render_pass.set_camera_viewport(&viewport);
     }
 
-    if !opaque_prepass_phase.is_empty() {
+    if !opaque_prepass_phase.is_suspended() && !opaque_prepass_phase.is_empty() {
         #[cfg(feature = "trace")]
         let _opaque_prepass_span = info_span!("opaque_prepass").entered();
         if let Err(err) = opaque_prepass_phase.render(&mut render_pass, world, view_entity) {
@@ -243,6 +255,7 @@ fn run_prepass_system(
     drop(render_pass);
 
     if deferred_prepass.is_none()
+        && !skip_depth_copy
         && let Some(prepass_depth_texture) = &view_prepass_textures.depth
     {
         // TODO: Copy depth texture fails for WebGL2, https://github.com/bevyengine/bevy/issues/9710

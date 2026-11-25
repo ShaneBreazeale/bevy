@@ -91,9 +91,9 @@ use crate::{
     },
     prepass::{
         AlphaMask3dPrepass, DeferredPrepass, DeferredPrepassDoubleBuffer, DepthPrepass,
-        DepthPrepassDoubleBuffer, MotionVectorPrepass, NormalPrepass, Opaque3dPrepass,
-        OpaqueNoLightmap3dBatchSetKey, OpaqueNoLightmap3dBinKey, ViewPrepassTextures,
-        MOTION_VECTOR_PREPASS_FORMAT, NORMAL_PREPASS_FORMAT,
+        DepthPrepassDoubleBuffer, MainPassDepthPrepass, MotionVectorPrepass, NormalPrepass,
+        Opaque3dPrepass, OpaqueNoLightmap3dBatchSetKey, OpaqueNoLightmap3dBinKey,
+        ViewPrepassTextures, MOTION_VECTOR_PREPASS_FORMAT, NORMAL_PREPASS_FORMAT,
     },
     schedule::Core3d,
     skybox::SkyboxPlugin,
@@ -142,6 +142,7 @@ impl Plugin for Core3dPlugin {
                         .in_set(RenderSystems::PrepareViews)
                         .ambiguous_with(RenderSystems::PrepareViews),
                     prepare_main_pass_layouts.in_set(MainPassLayoutSystems::Decide),
+                    suspend_opaque_prepass_phases.in_set(MainPassLayoutSystems::Finalize),
                     prepare_core_3d_depth_textures.in_set(RenderSystems::PrepareResources),
                     prepare_prepass_textures.in_set(RenderSystems::PrepareResources),
                 ),
@@ -562,6 +563,7 @@ pub fn extract_camera_prepass_phase(
                 Has<DeferredPrepass>,
                 Has<DepthPrepassDoubleBuffer>,
                 Has<DeferredPrepassDoubleBuffer>,
+                Option<&MainPassDepthPrepass>,
             ),
             With<Camera3d>,
         >,
@@ -582,6 +584,7 @@ pub fn extract_camera_prepass_phase(
         deferred_prepass,
         depth_prepass_double_buffer,
         deferred_prepass_double_buffer,
+        main_pass_depth_prepass,
     ) in cameras_3d.iter()
     {
         if !camera.is_active {
@@ -630,6 +633,12 @@ pub fn extract_camera_prepass_phase(
             camera_commands.insert(DepthPrepass);
         } else {
             camera_commands.remove::<DepthPrepass>();
+        }
+
+        if let Some(main_pass_depth_prepass) = main_pass_depth_prepass {
+            camera_commands.insert(*main_pass_depth_prepass);
+        } else {
+            camera_commands.remove::<MainPassDepthPrepass>();
         }
 
         if normal_prepass {
@@ -681,17 +690,21 @@ pub fn prepare_core_3d_depth_textures(
         &Msaa,
         Option<&MainPassLayout>,
         Has<TransientMsaa>,
+        Option<&MainPassDepthPrepass>,
     )>,
 ) {
     let mut render_target_usage = <HashMap<_, _>>::default();
     let mut views_per_texture = <HashMap<_, usize>>::default();
-    for (_, camera, depth_prepass, camera_3d, msaa, _, _) in &views_3d {
+    for (_, camera, depth_prepass, camera_3d, msaa, layout, _, main_pass_depth_prepass) in &views_3d
+    {
         *views_per_texture
             .entry((camera.target.clone(), *msaa))
             .or_default() += 1;
         // Default usage required to write to the depth texture
         let mut usage: TextureUsages = camera_3d.depth_texture_usages.into();
-        if depth_prepass.is_some() {
+        if depth_prepass.is_some()
+            && !MainPassDepthPrepass::skips_copy(main_pass_depth_prepass, layout)
+        {
             // Required to read the output of the prepass
             usage |= TextureUsages::COPY_SRC;
         }
@@ -702,7 +715,7 @@ pub fn prepare_core_3d_depth_textures(
     }
 
     let mut textures = <HashMap<_, _>>::default();
-    for (entity, camera, _, camera_3d, msaa, layout, transient_msaa) in &views_3d {
+    for (entity, camera, depth_prepass, camera_3d, msaa, layout, transient_msaa, _) in &views_3d {
         let Some(physical_target_size) = camera.physical_target_size else {
             continue;
         };
@@ -717,6 +730,7 @@ pub fn prepare_core_3d_depth_textures(
                 // A multisampled depth texture that only this view's merged main pass uses,
                 // and that is cleared there and never read, can stay in tile memory.
                 if transient_msaa
+                    && depth_prepass.is_none()
                     && msaa.samples() > 1
                     && usage == TextureUsages::RENDER_ATTACHMENT
                     && views_per_texture[&(camera.target.clone(), *msaa)] == 1
@@ -834,6 +848,38 @@ pub fn prepare_main_pass_layouts(
             None => {
                 commands.entity(entity).insert(new_layout);
             }
+        }
+    }
+}
+
+/// Leaves the opaque phase out of depth prepasses that only serve a merged main pass and ask for
+/// it with [`MainPassDepthPrepass::skip_opaque`].
+///
+/// The phase is suspended rather than removed: the layout can change from frame to frame, and only
+/// newly visible meshes would be queued into a phase that was created again.
+pub fn suspend_opaque_prepass_phases(
+    mut opaque_prepass_phases: ResMut<ViewBinnedRenderPhases<Opaque3dPrepass>>,
+    views: Query<
+        (
+            &ExtractedView,
+            &MainPassDepthPrepass,
+            Option<&MainPassLayout>,
+        ),
+        (
+            With<DepthPrepass>,
+            Without<NormalPrepass>,
+            Without<MotionVectorPrepass>,
+            Without<DeferredPrepass>,
+            Without<OcclusionCulling>,
+        ),
+    >,
+) {
+    for (view, main_pass_depth_prepass, layout) in &views {
+        if main_pass_depth_prepass.skip_opaque
+            && MainPassDepthPrepass::skips_copy(Some(main_pass_depth_prepass), layout)
+            && let Some(phase) = opaque_prepass_phases.get_mut(&view.retained_view_entity)
+        {
+            phase.suspend();
         }
     }
 }
@@ -1158,5 +1204,103 @@ fn package_double_buffered_depth_texture(
         }
         (Some(t1), Some(t2)) => Some(DepthStencilAttachment::new(t2, Some(t1), Some(0.0), None)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod main_pass_depth_prepass_tests {
+    use super::*;
+    use bevy_math::UVec4;
+    use bevy_transform::components::GlobalTransform;
+
+    const MERGED: MainPassLayout = MainPassLayout::Merged { keep_depth: false };
+
+    fn world() -> (World, Entity, RetainedViewEntity, Schedule) {
+        let mut world = World::new();
+        let retained = RetainedViewEntity::new(Entity::PLACEHOLDER.into(), None, 0);
+        let mut phases = ViewBinnedRenderPhases::<Opaque3dPrepass>::default();
+        phases.prepare_for_new_frame(retained, GpuPreprocessingMode::None);
+        world.insert_resource(phases);
+        let view = world
+            .spawn((
+                ExtractedView {
+                    retained_view_entity: retained,
+                    clip_from_view: Default::default(),
+                    world_from_view: GlobalTransform::IDENTITY,
+                    clip_from_world: None,
+                    target_format: CORE_3D_DEPTH_FORMAT,
+                    viewport: UVec4::ZERO,
+                    color_grading: Default::default(),
+                    invert_culling: false,
+                },
+                DepthPrepass,
+                MainPassDepthPrepass { skip_opaque: true },
+                MERGED,
+            ))
+            .id();
+        let mut schedule = Schedule::default();
+        schedule.add_systems(suspend_opaque_prepass_phases);
+        (world, view, retained, schedule)
+    }
+
+    /// Starts a new frame and returns whether the opaque prepass phase is suspended in it.
+    fn suspended(world: &mut World, view: RetainedViewEntity, schedule: &mut Schedule) -> bool {
+        world
+            .resource_mut::<ViewBinnedRenderPhases<Opaque3dPrepass>>()
+            .prepare_for_new_frame(view, GpuPreprocessingMode::None);
+        schedule.run(world);
+        world.resource::<ViewBinnedRenderPhases<Opaque3dPrepass>>()[&view].is_suspended()
+    }
+
+    #[test]
+    fn opaque_prepass_is_suspended_only_while_the_main_pass_is_merged() {
+        let (mut world, view, retained, mut schedule) = world();
+        assert!(suspended(&mut world, retained, &mut schedule));
+        // The split layout copies the depth for other passes, so it has to hold every mesh.
+        world.entity_mut(view).insert(MainPassLayout::Split);
+        assert!(!suspended(&mut world, retained, &mut schedule));
+        world.entity_mut(view).remove::<MainPassLayout>();
+        assert!(!suspended(&mut world, retained, &mut schedule));
+        // The phase was never removed, so it can be drawn and suspended again at any time.
+        world.entity_mut(view).insert(MERGED);
+        assert!(suspended(&mut world, retained, &mut schedule));
+    }
+
+    #[test]
+    fn opaque_prepass_is_drawn_when_something_else_needs_it() {
+        let (mut world, view, retained, mut schedule) = world();
+        world.entity_mut(view).insert(NormalPrepass);
+        assert!(!suspended(&mut world, retained, &mut schedule));
+        world.entity_mut(view).remove::<NormalPrepass>();
+        world.entity_mut(view).insert(MotionVectorPrepass);
+        assert!(!suspended(&mut world, retained, &mut schedule));
+        world.entity_mut(view).remove::<MotionVectorPrepass>();
+        world.entity_mut(view).insert(OcclusionCulling);
+        assert!(!suspended(&mut world, retained, &mut schedule));
+        world.entity_mut(view).remove::<OcclusionCulling>();
+        world.entity_mut(view).insert(DeferredPrepass);
+        assert!(!suspended(&mut world, retained, &mut schedule));
+        world.entity_mut(view).remove::<DeferredPrepass>();
+        world
+            .entity_mut(view)
+            .insert(MainPassDepthPrepass { skip_opaque: false });
+        assert!(!suspended(&mut world, retained, &mut schedule));
+        world.entity_mut(view).remove::<MainPassDepthPrepass>();
+        assert!(!suspended(&mut world, retained, &mut schedule));
+    }
+
+    #[test]
+    fn depth_is_copied_unless_only_a_merged_main_pass_uses_it() {
+        let opt_in = MainPassDepthPrepass::default();
+        assert!(MainPassDepthPrepass::skips_copy(
+            Some(&opt_in),
+            Some(&MERGED)
+        ));
+        assert!(!MainPassDepthPrepass::skips_copy(
+            Some(&opt_in),
+            Some(&MainPassLayout::Split)
+        ));
+        assert!(!MainPassDepthPrepass::skips_copy(Some(&opt_in), None));
+        assert!(!MainPassDepthPrepass::skips_copy(None, Some(&MERGED)));
     }
 }

@@ -117,6 +117,10 @@ pub fn batch_and_prepare_binned_render_phase<BPI, GFBD>(
     let system_param_item = param.into_inner();
 
     for phase in phases.values_mut() {
+        if phase.is_suspended() {
+            continue;
+        }
+
         // Prepare batchables.
 
         for bin in phase.batchable_meshes.values_mut() {

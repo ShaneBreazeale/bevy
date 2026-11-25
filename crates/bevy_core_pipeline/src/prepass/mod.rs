@@ -54,6 +54,7 @@ use bevy_render::{
         ShaderType, TextureFormat, TextureView,
     },
     texture::ColorAttachment,
+    view::MainPassLayout,
 };
 
 pub const NORMAL_PREPASS_FORMAT: TextureFormat = TextureFormat::Rgb10a2Unorm;
@@ -63,6 +64,29 @@ pub const MOTION_VECTOR_PREPASS_FORMAT: TextureFormat = TextureFormat::Rg16Float
 #[derive(Component, Default, Reflect, Clone)]
 #[reflect(Component, Default, Clone)]
 pub struct DepthPrepass;
+
+/// Opt-in for a [`bevy_camera::Camera3d`] whose [`DepthPrepass`] only serves the main pass's own
+/// depth test: while the main pass is [merged](MainPassLayout::Merged), the depth isn't copied to a
+/// separate texture.
+///
+/// Don't add this to a camera with an effect that samples the prepass depth during or after a merged
+/// main pass, such as contact shadows or screen space ambient occlusion: it would read stale depth.
+/// With the split layout the component does nothing, so effects that only need the depth there
+/// (temporal anti-aliasing, for example, which turns MSAA off) are safe.
+#[derive(Component, Default, Reflect, Clone, Copy)]
+#[reflect(Component, Default, Clone)]
+pub struct MainPassDepthPrepass {
+    /// Also leaves opaque (not alpha masked) meshes out of the prepass while the depth isn't copied,
+    /// unless normals, motion vectors, a deferred prepass or occlusion culling need them.
+    pub skip_opaque: bool,
+}
+
+impl MainPassDepthPrepass {
+    /// Whether a view with this component and main pass layout skips the prepass depth copy.
+    pub fn skips_copy(this: Option<&Self>, layout: Option<&MainPassLayout>) -> bool {
+        this.is_some() && layout.is_some_and(MainPassLayout::is_merged)
+    }
+}
 
 /// If added to a [`bevy_camera::Camera3d`] then vertex world normals will be copied to a separate texture available to the main pass.
 /// Normals will have normal map textures already applied.

@@ -1377,23 +1377,38 @@ impl Mesh {
 
         let vertex_size = self.get_vertex_size() as usize;
         let vertex_count = self.count_vertices();
-        // bundle into interleaved buffers
-        let mut attribute_offset = 0;
-        for attribute_data in mesh_attributes.values() {
-            let attribute_size = attribute_data.attribute.format.size() as usize;
-            let attributes_bytes = attribute_data.values.get_bytes();
-            for (vertex_index, attribute_bytes) in attributes_bytes
-                .chunks_exact(attribute_size)
-                .take(vertex_count)
-                .enumerate()
-            {
-                let offset = vertex_index * vertex_size + attribute_offset;
-                slice
-                    .slice(offset..offset + attribute_size)
-                    .copy_from_slice(attribute_bytes);
-            }
+        if vertex_size == 0 {
+            return;
+        }
 
-            attribute_offset += attribute_size;
+        // Interleave in a small scratch buffer and copy that out front to back. `slice` can be
+        // write-combined memory, like a GPU upload heap behind PCIe, where small scattered writes
+        // are very slow.
+        const SCRATCH_SIZE: usize = 32 * 1024;
+        let scratch_vertices = (SCRATCH_SIZE / vertex_size).max(1).min(vertex_count);
+        let mut scratch = vec![0; scratch_vertices * vertex_size];
+        for first_vertex in (0..vertex_count).step_by(scratch_vertices.max(1)) {
+            let vertices = scratch_vertices.min(vertex_count - first_vertex);
+            let mut attribute_offset = 0;
+            for attribute_data in mesh_attributes.values() {
+                let attribute_size = attribute_data.attribute.format.size() as usize;
+                let first_byte = first_vertex * attribute_size;
+                let attribute_bytes = &attribute_data.values.get_bytes()
+                    [first_byte..first_byte + vertices * attribute_size];
+                for (vertex, attribute) in scratch
+                    .chunks_exact_mut(vertex_size)
+                    .zip(attribute_bytes.chunks_exact(attribute_size))
+                {
+                    vertex[attribute_offset..attribute_offset + attribute_size]
+                        .copy_from_slice(attribute);
+                }
+                attribute_offset += attribute_size;
+            }
+            let offset = first_vertex * vertex_size;
+            let size = vertices * vertex_size;
+            slice
+                .slice(offset..offset + size)
+                .copy_from_slice(&scratch[..size]);
         }
     }
 
@@ -3242,6 +3257,30 @@ mod tests {
             RenderAssetUsages::default(),
         )
         .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, vec![[0.0, 0.0, 0.0]]);
+    }
+
+    /// The packed data doesn't depend on how it is split up, and attributes are truncated to the
+    /// shortest one.
+    #[test]
+    fn packed_vertex_data_interleaves_every_vertex() {
+        for count in [0, 1, 3, 2000, 5000] {
+            let positions: Vec<[f32; 3]> = (0..count + 2)
+                .map(|i| [i as f32, i as f32 + 0.25, -(i as f32)])
+                .collect();
+            let uvs: Vec<[f32; 2]> = (0..count).map(|i| [i as f32 * 0.5, 7.0]).collect();
+            let mesh = Mesh::new(
+                PrimitiveTopology::TriangleList,
+                RenderAssetUsages::default(),
+            )
+            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions.clone())
+            .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs.clone());
+            let expected: Vec<u8> = positions
+                .iter()
+                .zip(&uvs)
+                .flat_map(|(p, uv)| p.iter().chain(uv).flat_map(|v| v.to_ne_bytes()))
+                .collect();
+            assert_eq!(mesh.create_packed_vertex_buffer_data(), expected, "{count}");
+        }
     }
 
     #[test]
